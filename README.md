@@ -3,3 +3,5 @@
 
  In the `architecture` folder are found my implementation of these two models in Pytorch. In the `tokenization` folder, a class used to handle tokenization with HugginFace's *WordPiece* is available. <br>
  These are trained for the translation from italian to french in the two jupyter notebooks at the root of the repository.
+
+This repo is just meant to develop my knowledge.

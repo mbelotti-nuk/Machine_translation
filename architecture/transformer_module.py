@@ -5,7 +5,7 @@ from torch.nn.functional import softmax, log_softmax
 
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, trg_vocab_size, n_layers, n_heads, n_embed, dropout):
+    def __init__(self, src_vocab_size, trg_vocab_size, n_layers, n_heads, n_embed, context_length, dropout):
         super().__init__()
         # embedding + positional encoding 
         self.src_embedding = nn.Sequential( nn.Embedding(src_vocab_size, n_embed), PositionalEncoding(n_embed) )
@@ -16,7 +16,14 @@ class Transformer(nn.Module):
         
         self.projection = nn.Linear(n_embed, trg_vocab_size)
         self.init_weights()
-        self.temperature = 4*torch.ones(trg_vocab_size)
+
+        self.temperature = 0.2*torch.ones(trg_vocab_size)
+
+        self.context_length = context_length
+        self.register_buffer(
+            'full_trg_mask',
+            torch.triu(torch.ones(context_length, context_length), diagonal=1)
+        )
 
     def forward(self, src, trg, src_mask, trg_mask):
         return self.decode(self.encode(src, src_mask), trg, src_mask, trg_mask)
@@ -37,12 +44,24 @@ class Transformer(nn.Module):
         return self.make_src_mask(src, pad), self.make_tgt_mask(tgt, pad)
 
     def make_src_mask(self, src, pad):
-         return (src != pad).unsqueeze(-2)
+        """This mask is applied to source sentences which are filled with [PAD]
+        token if they end before the largest dimension of a sentece in a batch
+        of sentences
+
+        Args:
+            src (torch_Tensor): _description_
+            pad (_type_): character used for padding
+
+        Returns:
+            _type_: _description_
+        """
+        return (src != pad).unsqueeze(-2).unsqueeze(-2)
+    
 
     def make_tgt_mask(self, tgt, pad):
-        tgt_mask = (tgt != pad).unsqueeze(-2)
+        tgt_mask = (tgt != pad).unsqueeze(-2).unsqueeze(-2)
         # hide padding and future words
-        tgt_mask = tgt_mask & self.subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)
+        tgt_mask = tgt_mask & self.subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)        
         return tgt_mask
     
     def subsequent_mask(self, size):
@@ -52,6 +71,7 @@ class Transformer(nn.Module):
             torch.uint8
         )
         return subsequent_mask == 0
+        #return self.full_trg_mask[:size, :size]
     
     def init_weights(self):
         for p in self.parameters():
@@ -87,7 +107,8 @@ class EncoderLayer(nn.Module):
     def __init__(self, n_heads, n_embed, dropout=0.1):
         super().__init__()
         # first step: attention
-        self.multi_head_attn = MultiHeadAttention(n_heads, n_embed)
+        self.multi_head_attn = MultiHeadAttentionWrapper(n_heads, n_embed) # MultiHeadAttention(n_heads, n_embed)
+        #self.multi_head_attn = MultiHeadAttention(n_heads, n_embed)
         self.norm_1 = NormLayer(n_embed)
         # second step: reflection on attention
         self.ff = FeedForward(n_embed)
@@ -108,10 +129,11 @@ class DecoderLayer(nn.Module):
     def __init__(self, n_heads, n_embed, dropout=0.1):
         super().__init__()
         # first step: self-attention on translated sentence
-        self.self_attention = MultiHeadAttention(n_heads, n_embed) 
+        self.self_attention = MultiHeadAttentionWrapper(n_heads, n_embed) # MultiHeadAttention(n_heads, n_embed) 
+        #self.self_attention = MultiHeadAttention(n_heads, n_embed) 
         self.norm_1 = NormLayer(n_embed)
         # second step: cross-attention between embdeddings of encoder and the embeddings of the decoder
-        self.cross_attention = MultiHeadAttention(n_heads, n_embed)
+        self.cross_attention = MultiHeadAttentionWrapper(n_heads, n_embed) # MultiHeadAttention(n_heads, n_embed)
         self.norm_2 = NormLayer(n_embed)
         # third step: reflection on previous attention blocks
         self.ff = FeedForward(n_embed)
@@ -122,11 +144,14 @@ class DecoderLayer(nn.Module):
 
     def forward(self, src, x, src_mask, trg_mask):
         apply_self_attention = lambda x: self.self_attention(x, x, x, trg_mask)
-        # first step with skip connections and dropout
+        # first step with skip connections and dropout - self-attention on translated sentence
         x = x + self.dropout( apply_self_attention( self.norm_1( x ) ) ) # (B,T,E)
 
-        # second step with skip connections and dropout
-        apply_cross_attention = lambda x,y: self.self_attention(x, y, y, src_mask)
+        # second step with skip connections and dropout - cross-attention between embdeddings of encoder and the embeddings of the decoder
+        apply_cross_attention = lambda x,y: self.cross_attention(x, y, y, src_mask)
+        #query --> x
+        #key   --> src
+        #value --> src
         x = x + self.dropout( apply_cross_attention( self.norm_2( x ), src ) ) # (B,T,E)
 
         # third step with skip connections and dropout
@@ -146,50 +171,66 @@ class NormLayer(nn.Module):
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
         return self.beta * (x - mean) / (std + self.eps) + self.gamma
-    
 
-class MultiHeadAttention(nn.Module):
+
+class MultiHeadAttentionWrapper(nn.Module):
+    """
+        Multi head attention in ones step
+    """
     def __init__(self, n_heads, n_embed):
         super().__init__()
         assert n_embed % n_heads == 0, f"The embedding size (={n_embed}) and the number of heads (={n_heads}) must be divisible"
-        head_size = n_embed // n_heads
-        self.heads = nn.ModuleList( [ AttentionHead(n_embed, head_size) for i in range(n_heads) ] )
-    
-    def forward(self, query, key, value, mask):
-        return torch.cat([head(query, key, value, mask) for head in self.heads], dim=-1) # -> (B,T,EMBED_SIZE)
+        
+        self.n_heads = n_heads
+        self.head_size = n_embed // n_heads
+
+        self.K = nn.Linear(n_embed, n_embed, bias=False)
+        self.Q = nn.Linear(n_embed, n_embed, bias=False)
+        self.V = nn.Linear(n_embed, n_embed, bias=False)
 
 
-class AttentionHead(nn.Module):
-    def __init__(self, n_embed, head_size):
-        super().__init__()
-        self.K = nn.Linear(n_embed, head_size, bias=False) # key matrix
-        self.Q = nn.Linear(n_embed, head_size, bias=False) # query matrix
-        self.V = nn.Linear(n_embed, head_size, bias=False) # value matrix
+    def forward(self, query:torch.Tensor, key:torch.Tensor, value:torch.Tensor, mask):
+        # batch, time, channels. 
+        # --> time is equal to context window
+        # --> channels is equal to the embed size
+        B, Tq, Cq = query.shape 
+        B, Tk, Ck = key.shape
 
-    def forward(self, query:torch.Tensor, key:torch.Tensor, value:torch.Tensor, mask=None):
-        # batch, time, channels
-        # B,T,C = query.shape 
+        key = self.K(key)       #(B, Tk, Ck)
+        query = self.Q(query)   #(B, Tq, Cq)
+        value = self.V(value)   #(B, Tk, Ck)
 
-        key = self.K(key)       #(B,T,H)  where H is the head size
-        query = self.Q(query)   #(B,T,H)
-        value = self.V(value)   #(B,T,H)
-        affinities = self.attn_weights(query, key, mask)
+        key = key.view(B, Tk, self.n_heads, self.head_size)      #(B, Tk, N_HEADS, HEAD_SIZE)
+        query = query.view(B, Tq, self.n_heads, self.head_size)  #(B, Tq, N_HEADS, HEAD_SIZE)
+        value = value.view(B, Tk, self.n_heads, self.head_size)  #(B, Tk, N_HEADS, HEAD_SIZE)
 
-        return affinities @ value # (B,T,T) @ (B,T,H) = (B,T,H)
-    
-    def attn_weights(self, query, key, mask=None):
+        key = key.transpose(1,2)        #(B, N_HEADS, Tk, HEAD_SIZE)
+        query = query.transpose(1,2)    #(B, N_HEADS, Tq, HEAD_SIZE)
+        value = value.transpose(1,2)    #(B, N_HEADS, Tk, HEAD_SIZE)
+
+        affinities = self.attn_weights(query, key, mask) # (B, N_HEADS,Tk,Tq)
+
+        attn = affinities @ value # (B, N_HEADS,Tq,Tk) @ (B,N_HEADS,Tk,HEAD_SIZE)= (B,N_HEADS,Tq,HEAD_SIZE)
+        attn = attn.transpose(1, 2) # (B,Tq,N_HEADS,HEAD_SIZE)
+        attn = attn.contiguous().view(B, Tq, Cq)
+        return attn
+
+    def attn_weights(self, query, key, mask=None)->torch.Tensor:
         # compute attention scores
-        affinities = query @ key.transpose(-2,-1) # (B,T,H) @ (B,H,T) = (B,T,T)
+        affinities = query @ key.transpose(-2,-1) # (B, N_HEADS, Tq, HEAD_SIZE) @ (B, N_HEADS, HEAD_SIZE, Tk) = (B, N_HEADS,Tq,Tk)
         # scale attention
         head_size = query.size(-1)
         affinities = affinities * head_size ** (-0.5)
-        # mask
+
         if mask is not None:
-            affinities = affinities.masked_fill(mask==0, float('-inf'))
-            #print(f"affinities {affinities[0,0,:]}")
+            # il mask puo avvenire sia per source_sentences sia per target_sentences
+            # nel primo caso per mascherare i pad di riempimento
+            # nel secondo per mascherare i token futuri della frase che in questo caso verra tradotta
+            affinities = affinities.masked_fill(mask==0, -torch.inf)
+    
         # compute probabilities
         return affinities.softmax(-1) 
- 
+
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed):

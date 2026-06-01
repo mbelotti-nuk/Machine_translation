@@ -71,8 +71,7 @@ class translation_tokenizer:
         # normalizers
         tokenizer.normalizer = normalizers.Sequence([normalizers.NFD(), normalizers.Lowercase(), normalizers.StripAccents()])
         # split on white space and punctuation
-        tokenizer.pre_tokenizer = pre_tokenizers.Sequence( [pre_tokenizers.WhitespaceSplit(),
-                                                            pre_tokenizers.Punctuation()])
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence( [pre_tokenizers.WhitespaceSplit(), pre_tokenizers.Punctuation()] )
                 
         # build tokenization pipeline
         trainer = trainers.WordPieceTrainer(vocab_size=self.vocab_size, 
